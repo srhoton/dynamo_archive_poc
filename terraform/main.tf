@@ -6,6 +6,10 @@ terraform {
       source  = "hashicorp/aws"
       version = "~> 5.0"
     }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
   }
 
   backend "s3" {
@@ -16,11 +20,12 @@ terraform {
 }
 
 provider "aws" {
-  region = "us-east-1"
+  region = var.region
 }
 
+# DynamoDB table with streams enabled
 resource "aws_dynamodb_table" "dynamo_archive_poc" {
-  name             = "dynamo-archive-poc"
+  name             = var.project_name
   billing_mode     = "PAY_PER_REQUEST"
   hash_key         = "PK"
   range_key        = "SK"
@@ -38,22 +43,24 @@ resource "aws_dynamodb_table" "dynamo_archive_poc" {
   }
 
   tags = {
-    Name        = "dynamo-archive-poc"
-    Environment = "development"
-    Project     = "dynamo-archive-poc"
+    Name        = var.project_name
+    Environment = var.environment
+    Project     = var.project_name
   }
 }
 
+# S3 bucket for archived data
 resource "aws_s3_bucket" "dynamo_archive_poc" {
-  bucket = "srhoton-dynamo-archive-poc"
+  bucket = "srhoton-${var.project_name}"
 
   tags = {
-    Name        = "srhoton-dynamo-archive-poc"
-    Environment = "development"
-    Project     = "dynamo-archive-poc"
+    Name        = "srhoton-${var.project_name}"
+    Environment = var.environment
+    Project     = var.project_name
   }
 }
 
+# S3 bucket public access block
 resource "aws_s3_bucket_public_access_block" "dynamo_archive_poc" {
   bucket = aws_s3_bucket.dynamo_archive_poc.id
 
