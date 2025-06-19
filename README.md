@@ -1,28 +1,25 @@
 # DynamoDB Archive POC
 
-A proof of concept demonstrating automatic archiving of deleted DynamoDB records to S3 using AWS Lambda and DynamoDB Streams.
+A proof of concept demonstrating automatic archiving of deleted DynamoDB records to S3 using AWS EventBridge, Lambda, and DynamoDB Streams.
 
 ## Overview
 
-This project provides a serverless solution for preserving deleted DynamoDB records by automatically archiving them to S3. When records are deleted from a DynamoDB table, a Lambda function triggered by DynamoDB Streams captures the deletion event and stores the deleted record's data in S3 for long-term retention and audit purposes.
+This project provides a serverless solution for preserving deleted DynamoDB records by automatically archiving them to S3. The architecture uses AWS EventBridge to create a decoupled, event-driven system where DynamoDB stream events are filtered and only deletion events trigger Lambda processing. This approach significantly reduces Lambda invocations and costs while providing a scalable, maintainable archival solution.
 
 ## Architecture
 
-```
-┌─────────────────┐         ┌──────────────────┐         ┌─────────────────┐
-│                 │ DELETE   │                  │ Archive │                 │
-│  DynamoDB Table │────────▶ │  Lambda Function │────────▶│   S3 Bucket     │
-│  (with Streams) │ Events   │                  │  JSON   │                 │
-└─────────────────┘         └──────────────────┘         └─────────────────┘
-                                     │
-                                     │ Failed
-                                     │ Records
-                                     ▼
-                            ┌──────────────────┐
-                            │   SQS DLQ        │
-                            │                  │
-                            └──────────────────┘
-```
+![DynamoDB Archive POC Architecture](DynamoDB%20Archive%20POC%20Architecture.png)
+
+The architecture implements an event-driven data archival system using AWS EventBridge to decouple DynamoDB streams from Lambda processing:
+
+**Data Flow:**
+1. **DynamoDB Table** with streams captures all table changes (INSERT/MODIFY/REMOVE)
+2. **EventBridge Pipes** reads from DynamoDB stream and forwards events to EventBridge
+3. **EventBridge Bus** receives all stream events and routes them to filtering rules
+4. **EventBridge Rule** filters for REMOVE events only and triggers Lambda
+5. **Lambda Function** processes deletion events and archives data to S3
+6. **Error Handling** via SQS Dead Letter Queue for failed executions
+7. **Monitoring** through CloudWatch Logs for all Lambda activity
 
 ### Components
 
@@ -30,34 +27,61 @@ This project provides a serverless solution for preserving deleted DynamoDB reco
    - Configured with streams enabled (`NEW_AND_OLD_IMAGES` view type)
    - Uses composite keys (PK and SK) for flexible data modeling
    - Pay-per-request billing mode for cost optimization
+   - Stream captures all table changes in real-time
 
-2. **Lambda Function**
-   - Python 3.13 runtime
-   - Processes DynamoDB stream events in batches
-   - Filters for DELETE events only
+2. **EventBridge Pipes**
+   - Connects DynamoDB stream to EventBridge custom bus
+   - Batch size: 10 records, batching window: 5 seconds
+   - Starting position: LATEST, parallelization factor: 1
+   - Automatic retry: 3 attempts, max record age: 1 hour
+
+3. **EventBridge Custom Bus**
+   - Receives all DynamoDB stream events from pipes
+   - Routes events to filtering rules based on event patterns
+   - Source configured as `custom.dynamodb`
+
+4. **EventBridge Rule**
+   - Filters specifically for REMOVE (deletion) events
+   - Pattern matches: `eventName = ["REMOVE"]`
+   - Only triggers Lambda for deletion events, reducing invocations
+
+5. **Lambda Function**
+   - Python 3.13 runtime with 256MB memory, 300s timeout
+   - Processes only filtered DELETE events from EventBridge
    - Archives deleted records as JSON files in S3
    - Includes comprehensive error handling and logging
 
-3. **S3 Bucket**
+6. **S3 Bucket**
    - Stores archived records in JSON format
    - Organized by table name and record ID
    - Configured with public access blocking for security
+   - Bucket: `srhoton-dynamo-archive-poc`
 
-4. **SQS Dead Letter Queue**
-   - Captures failed processing attempts
-   - 14-day retention for troubleshooting
+7. **SQS Dead Letter Queue**
+   - Captures failed Lambda processing attempts
+   - 14-day message retention for troubleshooting
+   - Configured as Lambda dead letter config
 
-5. **CloudWatch Logs**
+8. **CloudWatch Logs**
    - Lambda execution logs with 14-day retention
-   - Structured logging for easy debugging
+   - Structured logging for easy debugging and monitoring
+
+9. **IAM Roles**
+   - **Lambda Execution Role**: S3 write, SQS access, CloudWatch logs
+   - **EventBridge Pipes Role**: DynamoDB stream read, EventBridge write
+   - Follows principle of least privilege
 
 ## Features
 
-- **Automatic Archiving**: Deleted records are automatically captured and stored
-- **Selective Processing**: Only DELETE events are processed, reducing Lambda invocations
-- **Error Resilience**: Failed records are sent to DLQ for later analysis
+- **Event-Driven Architecture**: Uses EventBridge for decoupled, scalable event processing
+- **Selective Processing**: Only DELETE events trigger Lambda, significantly reducing invocations
+- **Automatic Archiving**: Deleted records are automatically captured and stored in S3
+- **Batch Processing**: EventBridge Pipes batches stream events for efficient Lambda execution
+- **Error Resilience**: Multi-level error handling with retries and DLQ for failed records
 - **Scalable**: Serverless architecture scales automatically with load
-- **Cost-Effective**: Pay-per-use pricing model with optimized batch processing
+- **Cost-Effective**: Pay-per-use pricing with intelligent filtering to minimize costs
+- **Monitoring**: Comprehensive CloudWatch logging and metrics
+- **Security**: IAM least privilege with private S3 bucket and encrypted data
 - **Testable**: Comprehensive unit tests with 100% code coverage
 
 ## Prerequisites
@@ -221,9 +245,12 @@ aws logs tail /aws/lambda/dynamo-archive-stream-processor --follow
 ## Cost Considerations
 
 - **DynamoDB Streams**: Charged per read request unit
-- **Lambda**: Charged per invocation and GB-seconds
+- **EventBridge Pipes**: Charged per event processed from DynamoDB stream
+- **EventBridge**: Charged per event published to custom bus and rule evaluations
+- **Lambda**: Charged per invocation and GB-seconds (significantly reduced due to filtering)
 - **S3**: Storage costs for archived data
 - **CloudWatch Logs**: Log ingestion and storage
+- **Cost Optimization**: EventBridge filtering reduces Lambda invocations by ~66% (only DELETE events vs all stream events)
 
 ## Security
 
