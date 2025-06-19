@@ -1,8 +1,8 @@
 """
-DynamoDB Stream Lambda Function for archiving deleted records to S3.
+EventBridge Lambda Function for archiving deleted DynamoDB records to S3.
 
-This Lambda function processes DynamoDB stream events and archives
-deleted records to an S3 bucket for long-term storage.
+This Lambda function processes EventBridge events containing DynamoDB stream data
+and archives deleted records to an S3 bucket for long-term storage.
 """
 
 import json
@@ -21,10 +21,10 @@ s3_client = boto3.client("s3")
 
 def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     """
-    AWS Lambda handler for processing DynamoDB stream events.
+    AWS Lambda handler for processing EventBridge events containing DynamoDB stream data.
 
     Args:
-        event: DynamoDB stream event containing records
+        event: EventBridge event containing DynamoDB stream data
         context: Lambda context object
 
     Returns:
@@ -37,28 +37,38 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
         table_name = _get_env_variable("DYNAMODB_TABLE_NAME")
         s3_bucket = _get_env_variable("S3_BUCKET_NAME")
 
-        records = event.get("Records", [])
+        # Extract DynamoDB stream record from EventBridge event
+        dynamodb_record = _extract_dynamodb_record(event)
+
+        if not dynamodb_record:
+            logger.warning("No valid DynamoDB record found in EventBridge event")
+            return {
+                "processedCount": 0,
+                "totalRecords": 0,
+                "failedRecords": []
+            }
+
         processed_count = 0
         failed_records = []
 
-        logger.info(f"Processing {len(records)} DynamoDB stream records")
+        logger.info("Processing EventBridge event with DynamoDB stream data")
 
-        for record in records:
-            try:
-                if _is_delete_event(record):
-                    _archive_record_to_s3(record, table_name, s3_bucket)
-                    processed_count += 1
-                    logger.info(f"Archived deleted record: {_get_record_id(record)}")
-                else:
-                    logger.debug(f"Skipping non-delete event: {record.get('eventName', 'UNKNOWN')}")
+        try:
+            if _is_delete_event(dynamodb_record):
+                _archive_record_to_s3(dynamodb_record, table_name, s3_bucket)
+                processed_count += 1
+                logger.info(f"Archived deleted record: {_get_record_id(dynamodb_record)}")
+            else:
+                event_name = dynamodb_record.get('eventName', 'UNKNOWN')
+                logger.debug(f"Skipping non-delete event: {event_name}")
 
-            except Exception as e:
-                logger.error(f"Failed to process record {_get_record_id(record)}: {str(e)}")
-                failed_records.append({"recordId": _get_record_id(record), "error": str(e)})
+        except Exception as e:
+            logger.error(f"Failed to process record {_get_record_id(dynamodb_record)}: {str(e)}")
+            failed_records.append({"recordId": _get_record_id(dynamodb_record), "error": str(e)})
 
         result = {
             "processedCount": processed_count,
-            "totalRecords": len(records),
+            "totalRecords": 1,
             "failedRecords": failed_records,
         }
 
@@ -72,6 +82,42 @@ def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
     except Exception as e:
         logger.error(f"Lambda execution failed: {str(e)}")
         raise
+
+
+def _extract_dynamodb_record(event: dict[str, Any]) -> dict[str, Any] | None:
+    """
+    Extract DynamoDB stream record from EventBridge event.
+
+    Args:
+        event: EventBridge event containing DynamoDB stream data
+
+    Returns:
+        DynamoDB stream record or None if not found
+    """
+    try:
+        # EventBridge event structure has the DynamoDB stream record in the detail field
+        detail = event.get("detail", {})
+
+        # Validate that this is a DynamoDB stream event
+        if event.get("source") != "custom.dynamodb":
+            logger.warning(f"Event source is not custom.dynamodb: {event.get('source')}")
+            return None
+
+        if event.get("detail-type") != "DynamoDB Stream Event":
+            detail_type = event.get('detail-type')
+            logger.warning(f"Event detail-type is not DynamoDB Stream Event: {detail_type}")
+            return None
+
+        # The detail should contain the original DynamoDB stream record
+        if not detail:
+            logger.warning("EventBridge event detail is empty")
+            return None
+
+        return detail
+
+    except Exception as e:
+        logger.error(f"Failed to extract DynamoDB record from EventBridge event: {str(e)}")
+        return None
 
 
 def _get_env_variable(var_name: str) -> str:

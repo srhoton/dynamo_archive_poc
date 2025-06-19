@@ -1,5 +1,5 @@
 """
-Unit tests for the DynamoDB Stream Lambda function.
+Unit tests for the EventBridge Lambda function that processes DynamoDB stream events.
 """
 
 import json
@@ -13,6 +13,7 @@ from moto import mock_aws
 
 from lambda_function import (
     _archive_record_to_s3,
+    _extract_dynamodb_record,
     _get_env_variable,
     _get_record_id,
     _is_delete_event,
@@ -46,9 +47,18 @@ def sample_dynamodb_record():
 
 
 @pytest.fixture
-def sample_event(sample_dynamodb_record):
-    """Sample Lambda event with DynamoDB records."""
-    return {"Records": [sample_dynamodb_record]}
+def sample_eventbridge_event(sample_dynamodb_record):
+    """Sample EventBridge event containing DynamoDB stream data."""
+    return {
+        "version": "0",
+        "id": "event-id-123",
+        "detail-type": "DynamoDB Stream Event",
+        "source": "custom.dynamodb",
+        "account": "123456789012",
+        "time": "2023-01-01T12:00:00Z",
+        "region": "us-east-1",
+        "detail": sample_dynamodb_record
+    }
 
 
 @pytest.fixture
@@ -150,17 +160,56 @@ class TestS3Archiving:
             _archive_record_to_s3(sample_dynamodb_record, "test-table", "nonexistent-bucket")
 
 
+class TestEventBridgeExtraction:
+    """Test EventBridge event extraction functionality."""
+
+    def test_extract_dynamodb_record_success(self, sample_eventbridge_event, sample_dynamodb_record):
+        """Test successful extraction of DynamoDB record from EventBridge event."""
+        result = _extract_dynamodb_record(sample_eventbridge_event)
+        assert result == sample_dynamodb_record
+
+    def test_extract_dynamodb_record_wrong_source(self, sample_eventbridge_event):
+        """Test extraction fails with wrong source."""
+        sample_eventbridge_event["source"] = "wrong.source"
+        result = _extract_dynamodb_record(sample_eventbridge_event)
+        assert result is None
+
+    def test_extract_dynamodb_record_wrong_detail_type(self, sample_eventbridge_event):
+        """Test extraction fails with wrong detail-type."""
+        sample_eventbridge_event["detail-type"] = "Wrong Event Type"
+        result = _extract_dynamodb_record(sample_eventbridge_event)
+        assert result is None
+
+    def test_extract_dynamodb_record_empty_detail(self, sample_eventbridge_event):
+        """Test extraction fails with empty detail."""
+        sample_eventbridge_event["detail"] = {}
+        result = _extract_dynamodb_record(sample_eventbridge_event)
+        assert result is None
+
+    def test_extract_dynamodb_record_missing_detail(self, sample_eventbridge_event):
+        """Test extraction fails with missing detail."""
+        del sample_eventbridge_event["detail"]
+        result = _extract_dynamodb_record(sample_eventbridge_event)
+        assert result is None
+
+    def test_extract_dynamodb_record_malformed_event(self):
+        """Test extraction handles malformed events gracefully."""
+        malformed_event = {"not": "valid"}
+        result = _extract_dynamodb_record(malformed_event)
+        assert result is None
+
+
 class TestLambdaHandler:
     """Test the main Lambda handler function."""
 
     @patch.dict(os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"})
     @mock_aws
-    def test_lambda_handler_success(self, sample_event, sample_context):
-        """Test successful Lambda execution."""
+    def test_lambda_handler_success(self, sample_eventbridge_event, sample_context):
+        """Test successful Lambda execution with EventBridge event."""
         s3_client = boto3.client("s3", region_name="us-east-1")
         s3_client.create_bucket(Bucket="test-bucket")
 
-        result = lambda_handler(sample_event, sample_context)
+        result = lambda_handler(sample_eventbridge_event, sample_context)
 
         assert result["processedCount"] == 1
         assert result["totalRecords"] == 1
@@ -170,68 +219,61 @@ class TestLambdaHandler:
             Bucket="test-bucket", Key="test-table/id_user-123_timestamp_1234567890.json"
         )
         archived_data = json.loads(response["Body"].read())
-        assert archived_data == sample_event["Records"][0]
+        assert archived_data == sample_eventbridge_event["detail"]
 
     @patch.dict(os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"})
-    def test_lambda_handler_skip_non_delete(self, sample_event, sample_context):
+    def test_lambda_handler_skip_non_delete(self, sample_eventbridge_event, sample_context):
         """Test Lambda handler skips non-DELETE events."""
-        sample_event["Records"][0]["eventName"] = "INSERT"
+        sample_eventbridge_event["detail"]["eventName"] = "INSERT"
 
         with mock_aws():
             s3_client = boto3.client("s3", region_name="us-east-1")
             s3_client.create_bucket(Bucket="test-bucket")
 
-            result = lambda_handler(sample_event, sample_context)
+            result = lambda_handler(sample_eventbridge_event, sample_context)
 
             assert result["processedCount"] == 0
             assert result["totalRecords"] == 1
             assert result["failedRecords"] == []
 
     @patch.dict(os.environ, {})
-    def test_lambda_handler_missing_env_vars(self, sample_event, sample_context):
+    def test_lambda_handler_missing_env_vars(self, sample_eventbridge_event, sample_context):
         """Test Lambda handler with missing environment variables."""
         with pytest.raises(ValueError, match="Required environment variable"):
-            lambda_handler(sample_event, sample_context)
+            lambda_handler(sample_eventbridge_event, sample_context)
 
     @patch.dict(os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"})
     @mock_aws
-    def test_lambda_handler_s3_error(self, sample_event, sample_context):
+    def test_lambda_handler_s3_error(self, sample_eventbridge_event, sample_context):
         """Test Lambda handler with S3 error."""
         with pytest.raises(Exception, match="Failed to process 1 records"):
-            lambda_handler(sample_event, sample_context)
+            lambda_handler(sample_eventbridge_event, sample_context)
 
     @patch.dict(os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"})
-    @mock_aws
-    def test_lambda_handler_multiple_records(self, sample_dynamodb_record, sample_context):
-        """Test Lambda handler with multiple records."""
-        s3_client = boto3.client("s3", region_name="us-east-1")
-        s3_client.create_bucket(Bucket="test-bucket")
+    def test_lambda_handler_invalid_eventbridge_event(self, sample_context):
+        """Test Lambda handler with invalid EventBridge event."""
+        invalid_event = {
+            "source": "wrong.source",
+            "detail-type": "Wrong Type",
+            "detail": {}
+        }
 
-        record2 = sample_dynamodb_record.copy()
-        record2["eventID"] = "test-event-id-456"
-        record2["dynamodb"]["Keys"]["id"]["S"] = "user-456"
+        result = lambda_handler(invalid_event, sample_context)
 
-        record3 = sample_dynamodb_record.copy()
-        record3["eventName"] = "INSERT"
-        record3["eventID"] = "test-event-id-789"
-
-        event = {"Records": [sample_dynamodb_record, record2, record3]}
-
-        result = lambda_handler(event, sample_context)
-
-        assert result["processedCount"] == 2
-        assert result["totalRecords"] == 3
+        assert result["processedCount"] == 0
+        assert result["totalRecords"] == 0
         assert result["failedRecords"] == []
 
-    def test_lambda_handler_empty_records(self, sample_context):
-        """Test Lambda handler with empty records."""
-        event = {"Records": []}
+    @patch.dict(os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"})
+    def test_lambda_handler_missing_detail(self, sample_context):
+        """Test Lambda handler with EventBridge event missing detail."""
+        event_without_detail = {
+            "source": "custom.dynamodb",
+            "detail-type": "DynamoDB Stream Event"
+        }
 
-        with patch.dict(
-            os.environ, {"DYNAMODB_TABLE_NAME": "test-table", "S3_BUCKET_NAME": "test-bucket"}
-        ):
-            result = lambda_handler(event, sample_context)
+        result = lambda_handler(event_without_detail, sample_context)
 
-            assert result["processedCount"] == 0
-            assert result["totalRecords"] == 0
-            assert result["failedRecords"] == []
+        assert result["processedCount"] == 0
+        assert result["totalRecords"] == 0
+        assert result["failedRecords"] == []

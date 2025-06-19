@@ -24,11 +24,12 @@ The archiving happens transparently through DynamoDB Streams. No extra API calls
 
 DynamoDB Streams guarantees at-least-once delivery of every change. When a record is deleted:
 - DynamoDB captures the deletion event (including the full record that was deleted)
-- The stream triggers our Lambda function
+- The stream flows through EventBridge Pipes to a custom EventBridge bus
+- EventBridge rules filter for deletion events and trigger our Lambda function
 - The Lambda archives the deleted record to S3
 - If anything fails, the built-in retry mechanism and DLQ ensure we don't lose data
 
-This isn't a "best effort" solution - it's a guaranteed capture mechanism.
+This isn't a "best effort" solution - it's a guaranteed capture mechanism with the added flexibility of event-driven architecture.
 
 ### 3. Complete Record Preservation
 
@@ -127,20 +128,21 @@ This pattern works identically across all your services because deleted records 
 
 ### Contact Service
 ```
-Deleted records → Lambda → s3://archives/usr-contact-svc/2024/01/15/CONTACT#123.json
+Deleted records → EventBridge → Lambda → s3://archives/usr-contact-svc/2024/01/15/CONTACT#123.json
 ```
 ### Service Order Service
 ```
-Deleted records → Lambda → s3://archives/sor-service-order-svc/2024/01/15/ORDER#456.json
+Deleted records → EventBridge → Lambda → s3://archives/sor-service-order-svc/2024/01/15/ORDER#456.json
 ```
 
 ### Unit Service
 ```
-Deleted records → Lambda → s3://archives/unt-svc/2024/01/15/UNIT#789.json
+Deleted records → EventBridge → Lambda → s3://archives/unt-svc/2024/01/15/UNIT#789.json
 ```
 
 Each service gets its own:
 - DynamoDB table (with streams enabled)
+- EventBridge bus and rules (configurable event bus name)
 - Lambda function (can be the same code, different environment variables)
 - S3 path prefix for organization
 
@@ -173,23 +175,73 @@ old_image = archived['dynamodb']['OldImage']
 dynamodb.put_item(TableName='users-table', Item=old_image)
 ```
 
+## EventBridge Architecture Benefits
+
+The implementation uses EventBridge as an intermediary between DynamoDB Streams and Lambda processing, providing several key advantages:
+
+### Event-Driven Flexibility
+- **Multiple Consumers**: The same DynamoDB stream events can trigger multiple different processing pipelines
+- **Configurable Event Buses**: Each service can have its own isolated event bus or share a common one
+- **Event Filtering**: EventBridge rules filter events before triggering Lambda, reducing unnecessary invocations
+- **Loose Coupling**: Lambda functions are triggered by events, not directly coupled to DynamoDB streams
+
+### Scalability and Extensibility
+- **Fan-out Patterns**: One deletion event can trigger archiving, analytics, and notifications simultaneously
+- **Future-Proof**: Easy to add new event consumers without modifying existing infrastructure
+- **Cross-Service Events**: Events can be routed to different services based on business rules
+
+### Architecture Flow
+```
+DynamoDB Table (with streams) 
+    ↓
+DynamoDB Stream
+    ↓ 
+EventBridge Pipe (captures all events: INSERT, MODIFY, REMOVE)
+    ↓
+Custom EventBridge Bus
+    ↓
+EventBridge Rule (filters for REMOVE events only)
+    ↓
+Lambda Function (processes deletion events)
+    ↓
+S3 Archive Storage
+```
+
 ## Implementation Checklist
 
 When implementing this pattern for a new service:
 
 1. **Enable DynamoDB Streams** on your table with `NEW_AND_OLD_IMAGES`
-2. **Deploy the Lambda** (reuse the code, just change environment variables)
-3. **Configure S3 path** to organize by service/date
-4. **Set lifecycle policies** based on your retention requirements
-5. **Enable TTL if appropriate** for automatic expiration of temporary data
-6. **Test deletion and retrieval** before going to production (both manual and TTL deletions)
-7. **Monitor the DLQ** to ensure everything is working
+2. **Configure EventBridge Bus** (use configurable `event_bus_name` variable or default to project name)
+3. **Deploy EventBridge Pipe** to capture stream events and route to your event bus
+4. **Set up EventBridge Rules** to filter for deletion events
+5. **Deploy the Lambda** (reuse the code, just change environment variables)
+6. **Configure S3 path** to organize by service/date
+7. **Set lifecycle policies** based on your retention requirements
+8. **Enable TTL if appropriate** for automatic expiration of temporary data
+9. **Test deletion and retrieval** before going to production (both manual and TTL deletions)
+10. **Monitor the DLQ** to ensure everything is working
 
 ## Future Possibilities
 
-While our focus is on archiving deleted records, this same event stream infrastructure opens doors for the future:
+The EventBridge-based architecture significantly expands possibilities beyond just archiving deleted records:
 
-- **Analytics**: Those deletion events could feed into analytics pipelines
-- **Compliance Reporting**: Generate deletion reports automatically
+### Immediate Enhancements
+- **Analytics Pipelines**: All DynamoDB events (not just deletions) flow through EventBridge and can feed analytics systems
+- **Real-time Notifications**: Alert systems when critical records are deleted
+- **Compliance Reporting**: Generate deletion and modification reports automatically
+- **Cross-Service Integration**: Events can trigger workflows in other services
+
+### Advanced Patterns
 - **Soft Deletes**: Implement application-level soft deletes with automatic hard delete after X days
-- **Data Lake Integration**: Archived records can be queried with Athena when needed
+- **Data Lake Integration**: All events (CREATE, UPDATE, DELETE) can be streamed to data lakes for comprehensive analytics
+- **Event Sourcing**: Build event sourcing systems using the complete stream of DynamoDB changes
+- **Multi-Region Replication**: Route events to trigger replication or backup processes in other regions
+
+### EventBridge Native Features
+- **Schema Registry**: Define and evolve event schemas over time
+- **Event Replay**: Replay historical events for testing or recovery scenarios
+- **Custom Applications**: Any application can subscribe to events by adding EventBridge rules
+- **Third-Party Integrations**: Direct integration with SaaS applications that support EventBridge
+
+The beauty of this architecture is that adding new capabilities requires only new EventBridge rules and targets - the core DynamoDB → EventBridge infrastructure remains unchanged.

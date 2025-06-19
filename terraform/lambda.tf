@@ -47,19 +47,40 @@ resource "aws_lambda_function" "dynamo_archive_processor" {
   }
 }
 
-# DynamoDB stream event source mapping
-resource "aws_lambda_event_source_mapping" "dynamo_stream_trigger" {
-  event_source_arn                   = aws_dynamodb_table.dynamo_archive_poc.stream_arn
-  function_name                      = aws_lambda_function.dynamo_archive_processor.arn
-  starting_position                  = "LATEST"
-  batch_size                         = var.lambda_batch_size
-  maximum_batching_window_in_seconds = var.lambda_batching_window_seconds
+# EventBridge rule to trigger Lambda on DynamoDB deletion events
+resource "aws_cloudwatch_event_rule" "dynamo_delete_events" {
+  name           = "${var.project_name}-dynamo-delete-events"
+  description    = "Trigger Lambda for DynamoDB deletion events"
+  event_bus_name = aws_cloudwatch_event_bus.dynamo_stream.name
 
-  filter_criteria {
-    filter {
-      pattern = jsonencode({
-        eventName = ["REMOVE"]
-      })
+  event_pattern = jsonencode({
+    source      = ["custom.dynamodb"]
+    detail-type = ["DynamoDB Stream Event"]
+    detail = {
+      eventName = ["REMOVE"]
     }
+  })
+
+  tags = {
+    Name        = "${var.project_name}-dynamo-delete-events"
+    Environment = var.environment
+    Project     = var.project_name
   }
+}
+
+# EventBridge target to invoke Lambda
+resource "aws_cloudwatch_event_target" "lambda_target" {
+  rule           = aws_cloudwatch_event_rule.dynamo_delete_events.name
+  target_id      = "lambda-target"
+  arn            = aws_lambda_function.dynamo_archive_processor.arn
+  event_bus_name = aws_cloudwatch_event_bus.dynamo_stream.name
+}
+
+# Lambda permission for EventBridge to invoke the function
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowExecutionFromEventBridge"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.dynamo_archive_processor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.dynamo_delete_events.arn
 }
