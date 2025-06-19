@@ -57,3 +57,14 @@ variable "dlq_retention_days" {
   type        = number
   default     = 14
 }
+
+variable "event_bus_name" {
+  description = "Name of the EventBridge event bus"
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.event_bus_name == null || can(regex("^[a-zA-Z0-9._-]+$", var.event_bus_name))
+    error_message = "Event bus name must contain only alphanumeric characters, periods, hyphens, and underscores."
+  }
+}
