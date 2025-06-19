@@ -250,7 +250,6 @@ aws logs tail /aws/lambda/dynamo-archive-stream-processor --follow
 - **Lambda**: Charged per invocation and GB-seconds (significantly reduced due to filtering)
 - **S3**: Storage costs for archived data
 - **CloudWatch Logs**: Log ingestion and storage
-- **Cost Optimization**: EventBridge filtering reduces Lambda invocations by ~66% (only DELETE events vs all stream events)
 
 ## Security
 
