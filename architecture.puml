@@ -1,0 +1,88 @@
+@startuml DynamoDB Archive POC Architecture
+!theme aws-orange
+title DynamoDB Archive POC - Event-Driven Data Archival System
+
+!define AWSPuml https://raw.githubusercontent.com/awslabs/aws-icons-for-plantuml/v19.0/dist
+!includeurl AWSPuml/AWSCommon.puml
+!includeurl AWSPuml/Database/DynamoDB.puml
+!includeurl AWSPuml/ApplicationIntegration/EventBridge.puml
+!includeurl AWSPuml/Compute/Lambda.puml
+!includeurl AWSPuml/Storage/SimpleStorageService.puml
+!includeurl AWSPuml/ApplicationIntegration/SimpleQueueService.puml
+
+left to right direction
+
+' Define AWS Resources with proper AWS icons
+DynamoDB(dynamodb, "DynamoDB Table", "dynamo-archive-poc")
+EventBridge(pipes, "EventBridge Pipes", "dynamo-stream-pipe")  
+EventBridge(eventbus, "EventBridge Bus", "Custom Event Bus")
+EventBridge(rule, "EventBridge Rule", "REMOVE Filter")
+Lambda(lambda, "Lambda Function", "dynamo-archive-processor")
+SimpleStorageService(s3, "S3 Bucket", "srhoton-dynamo-archive-poc")
+SimpleQueueService(dlq, "SQS DLQ", "lambda-dlq")
+rectangle "CloudWatch Logs" as logs #759C3E
+
+' IAM Roles
+actor "Lambda IAM Role" as iam_lambda #FF6B6B
+actor "Pipes IAM Role" as iam_pipes #FF6B6B
+
+' Main data flow (blue arrows)
+dynamodb -[#2196F3]-> pipes : "Stream Events\n(INSERT/MODIFY/REMOVE)"
+pipes -[#2196F3]-> eventbus : "All Events\nFiltered & Forwarded"
+eventbus -[#2196F3]-> rule : "Event Matching\nSource: custom.dynamodb"
+rule -[#2196F3]-> lambda : "REMOVE Events Only\nTrigger Lambda"
+lambda -[#4CAF50]-> s3 : "Archive Data\nStore deleted records"
+
+' Error handling (red arrows)
+lambda -[#FF4B4B]-> dlq : "Failed Executions\nDead letter queue"
+
+' Logging (green arrows)
+lambda -[#759C3E]-> logs : "Execution Logs\nRuntime information"
+
+' IAM relationships (dashed pink)
+iam_lambda -[#FF6B6B,dashed]-> lambda : "IAM Role\nAttachment"
+iam_pipes -[#FF6B6B,dashed]-> pipes : "IAM Role\nAttachment"
+
+
+note right of dynamodb
+**DynamoDB Configuration**
+• Table: dynamo-archive-poc
+• Streams: NEW_AND_OLD_IMAGES
+• Keys: PK (Hash), SK (Range)
+• Billing: PAY_PER_REQUEST
+• Stream: LATEST position
+• Parallelization: 1
+• Max batching window: 5s
+end note
+
+note right of lambda
+**Lambda Configuration**
+• Function: dynamo-archive-processor
+• Runtime: Python 3.13
+• Memory: 256MB, Timeout: 300s
+• Environment Variables:
+  - DYNAMODB_TABLE_NAME
+  - S3_BUCKET_NAME
+
+**Trigger Pattern**
+• Source: custom.dynamodb
+• Detail-type: DynamoDB Stream Event  
+• EventName: REMOVE only
+end note
+
+note right of s3
+**S3 Configuration**
+• Bucket: srhoton-dynamo-archive-poc
+• Security Features:
+  - Block all public access
+  - Encryption at rest
+  - Access via Lambda only
+  - Tagged for governance
+end note
+
+footer
+Generated from Terraform configuration
+Event-driven archival: Only deleted DynamoDB records are archived to S3
+end footer
+
+@enduml
